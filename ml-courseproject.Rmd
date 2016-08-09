@@ -1,0 +1,259 @@
+---
+title: "Machine Learning in Practice: Course project"
+author: "Ines Garmendia"
+date: "8th August, 2016"
+output: html_document
+---
+```{r preliminaries, echo = FALSE, warning = FALSE, message=FALSE}
+library(caret)
+library(ggplot2)
+library(outliers)
+library(randomForest)
+```
+# PART 0: Problem Setting
+Our goal is to use data of 6 participants in a experiment to determine how well they did a bunch of barbell lifts. 
+
+In the experiments some exercises were correctly performed (class A), while others were deliberately incorrect (throwing elbows to the front: class B, lifting the dumbbell only halfway: class C,...). The _classe_ variable records the type of exercise (one correct vs four incorrect), and our goal is to use data to predict this variable.
+
+## Note for the reviewer
+Most of ML models computed for this exercise take up to 30 minutes to compute. This file contains all the necessary code to reproduce the models, but it was compiled by loading a .RData file already containing the results. The .RData file can be found in the GitHub repo.
+
+# PART 1: Reading and Pre-processing data
+```{r readData}
+# Set working directory
+setwd("~/Documents/practical_ml_coursera")
+load("~/Documents/practical_ml_coursera/project-results.RData") #local directory
+pml.train <- read.csv2(file = "./data/pml-training.csv", 
+                       dec=".",
+                       header = TRUE, 
+                       sep =",",
+                       stringsAsFactors = TRUE)
+#
+pml.test <- read.csv2(file = "./data/pml-testing.csv", 
+                       dec=".",
+                       header = TRUE, 
+                       sep =",",
+                       stringsAsFactors = TRUE)
+```
+
+After reading the data we perform a quick check of the variables to see what kind of information they provide.
+
+```{r}
+summary(pml.train)
+```
+
+Some variables have a high proportion of NA's (see for instance *avg_yaw_forearm* with 19216 of NA's, more than 97 percent); and others do not have relevant information, such as _X_ variable. First, we manually remove non-relevant data (note: variable *user_name* should be relevant but we won't be using it for this exercise). Secondly, we identify and remove variables with a high proportion of NA's.
+
+```{r}
+n <- names(pml.train)
+realvars <- n[-c(1:7)]
+# Function
+countNA <- function(var){
+        sum(is.na(pml.train[, var])) / nrow(pml.train)
+}
+#n 
+s <- sapply(realvars, countNA)
+s <- unname(s)
+rmfurther <- realvars[which(s > 0.9)]
+#summary(pml.train[, rmfurther]) #ok to remove them
+#Remove
+finalvars <- setdiff(realvars, rmfurther)
+pml.train2 <- pml.train[,finalvars]
+pml.test2  <- pml.test[, finalvars[-86]] # we don't have classe var in the test examples
+```
+
+Now that we have the relevant data we separate a training and a test set.
+```{r dataPartition}
+set.seed(12345)
+inTrain <- createDataPartition(y = pml.train$classe, p=0.75, list = FALSE)
+training <- pml.train2[inTrain, ] #14718 rows
+testing <- pml.train2[-inTrain, ] #4904 rows
+```
+
+We now focus on the training set; we will reserve the testing set to estimate generalization error.
+```{r finalCheck, eval = FALSE}
+summary(training)
+```
+
+We have variables with very little variability such as *skewness_roll_forearm*. We identify those (*near-zero variance* variables) using caret package.
+```{r}
+nzv <- nearZeroVar(training, saveMetrics = TRUE)
+length(which(nzv$nzv == TRUE)) 
+```
+We will remove 33 variables. 
+```{r removeNZVvars}
+keepvars <- names(training)[which(nzv$nzv == FALSE)]
+training <- training[, keepvars] #53 variables and 14718 rows
+testing <- testing[, keepvars] #53 variables and 4904 rows
+testGen <- pml.test2[, keepvars[-53]]
+```
+
+## Principal Components Analysis
+Variables are numeric and sometimes highly correlated, thus a dimensionality reduction should work.
+```{r principalComponents}
+#Example: variabes related to X coordinate. Sometimes high correlations.
+grep(pattern = "_x$", x = keepvars)
+cor(training[, grep(pattern = "_x$", x = keepvars)])
+# Perform PCA processing with caret
+# First identify numeric features
+numericfeat <- names(training)[-which(names(training) == "classe")]
+#
+pca <- prcomp(x = training[, numericfeat], scale = TRUE)
+summary(pca) # 10 components retain 76 percent of variance; 18 components retain 90 percent
+```
+We will choose either 10 or 18 principal components, in order to evaluate if 18 vs 10 components is worth enough for performance.
+```{r preProcess}
+# Choose scale = true to normalize features
+preProc1 <- preProcess(training[, numericfeat], method = "pca", scale = TRUE, center = TRUE, pcaComp = 10)
+preProc2 <- preProcess(training[, numericfeat], method = "pca", scale = TRUE, center = TRUE, pcaComp = 18)
+#
+train1 <- predict.preProcess(preProc1, training) 
+test1 <- predict.preProcess(preProc1, testing) 
+#
+train2 <- predict.preProcess(preProc2, training) 
+test2 <- predict.preProcess(preProc2, testing) 
+# we will also apply this preprocessing to the test set. Reserve for the final assessment.
+testGen <- predict.preProcess(preProc2, testGen )
+```
+
+# PART 2: Training models - Experiment
+We choose the Random Forest paradigm which works well in much of settings. But, to be sure that this type of models works, we will do the following experiment. We separate the training set in 10 folds of equal size. Then we train a model for the first fold, for the first and second,...etc, both for 10 and for 18 principal components, and we will monitor how much accuracy is gained each time.
+
+## Separating folds for the Random Forest experiment
+In order to make a proper assessment we will use the 9th and 10th folds (20 percent of the sample) to assess model performance (we won't be using the test set, which is reserved to estimate the generalization error of the final model). 
+
+We compute 10 independent, random folds:
+```{r 10folds}
+set.seed(12345)
+folds <- createFolds(train1$classe, k = 10, list = TRUE, returnTrain = FALSE)
+folds_2 <- createFolds(train2$classe, k = 10, list = TRUE, returnTrain = FALSE)
+#returns a list of folds, we have to extract each sample in a cumulative way
+fold1 <- train1[folds[[1]], ]; fold1_2 <- train2[folds_2[[1]], ]
+fold2 <- train1[c(folds[[1]], folds[[2]]), ]; fold2_2 <- train2[c(folds_2[[1]], folds_2[[2]]), ]
+fold3 <- train1[c(folds[[1]], folds[[2]], folds[[3]]), ]; fold3_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]]), ]
+fold4 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]]), ]; fold4_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]]), ]
+fold5 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]], folds[[5]]), ]; fold5_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]], folds_2[[5]]), ]
+fold6 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]], folds[[5]], folds[[6]]), ]; fold6_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]], folds_2[[5]], folds_2[[6]]), ]
+fold7 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]], folds[[5]], folds[[6]], folds[[7]]), ]; fold7_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]], folds_2[[5]], folds_2[[6]], folds_2[[7]]), ]
+fold8 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]], folds[[5]], folds[[6]], folds[[7]], folds[[8]]), ]; fold8_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]], folds_2[[5]], folds_2[[6]], folds_2[[7]],folds_2[[8]]), ]
+fold9 <- train1[c(folds[[1]], folds[[2]], folds[[3]], folds[[4]], folds[[5]], folds[[6]], folds[[7]], folds[[8]], folds[[9]]), ]; fold9_2 <- train2[c(folds_2[[1]], folds_2[[2]], folds_2[[3]], folds_2[[4]], folds_2[[5]], folds_2[[6]], folds_2[[7]], folds_2[[8]], folds_2[[9]]), ]
+```
+
+## Function for accuracy assessment
+We will use our own function to assess accuracy.
+```{r accuracyFunction}
+accur <- function(fit, validation){
+        pred <- predict(object = fit, validation)
+        sum(diag(table(validation$classe, pred))) / length(pred)
+}
+```
+
+## Fitting Random Forests to the folds
+Now, for each fold we fit two models: one RF with 10 principal components, and the other with 18 components. For each fold, accuracy for the two models is recorded in a dataset named _df_. The plot of the results is shown below.
+### Note for the reviewer. 
+As we pointed out at the beginning, computations are not performed here but the code is shown.
+```{r rfExperiment, eval=FALSE}
+sizes1 <- c(nrow(fold1), 
+            nrow(fold2), 
+            nrow(fold3),
+            nrow(fold4),
+            nrow(fold5),
+            nrow(fold6),
+            nrow(fold7),
+            nrow(fold8),
+            nrow(fold9))
+sizes2 <- c(nrow(fold1_2), 
+            nrow(fold1_2), 
+            nrow(fold3_2),
+            nrow(fold4_2),
+            nrow(fold5_2),
+            nrow(fold6_2),
+            nrow(fold7_2),
+            nrow(fold8_2),
+            nrow(fold9_2))
+df <- data.frame(sizes1, sizes2)
+df$accur1 <- rep(0, 9) #accuracies with 10 PC
+df$accur2 <- rep(0, 9) #accuracies with 18 PC
+#
+validation = train1[folds[[10]], ] 
+validation_2 = train2[folds[[10]], ]
+fit1 <- train(classe ~ ., data = fold1, method = "rf", prox = FALSE)
+df[1,]$accur1 <- accur(fit1, validation = validation)
+fit1_2 <- train(classe ~ ., data = fold1_2, method = "rf", prox = FALSE)
+df[1,]$accur2 <- accur(fit1_2, validation = validation_2)
+#
+fit2 <- train(classe ~ ., data = fold2, method = "rf", prox = FALSE)
+df[2,]$accur1 <- accur(fit2, validation = validation)
+fit2_2 <- train(classe ~ ., data = fold2_2, method = "rf", prox = FALSE)
+df[2,]$accur2 <- accur(fit2_2, validation = validation_2)
+#
+fit3 <- train(classe ~ ., data = fold3, method = "rf", prox = FALSE)
+df[3,]$accur1 <- accur(fit3, validation = validation)
+fit3_2 <- train(classe ~ ., data = fold3_2, method = "rf", prox = FALSE)
+df[3,]$accur2 <- accur(fit3_2, validation = validation_2)
+#
+fit4 <- train(classe ~ ., data = fold4, method = "rf", prox = FALSE)
+df[4,]$accur1 <- accur(fit4, validation = validation)
+fit4_2 <- train(classe ~ ., data = fold4_2, method = "rf", prox = FALSE)
+df[4,]$accur2 <- accur(fit4_2, validation = validation_2)
+#
+fit5 <- train(classe ~ ., data = fold5, method = "rf", prox = FALSE)
+df[5,]$accur1 <- accur(fit5, validation = validation)
+fit5_2 <- train(classe ~ ., data = fold5_2, method = "rf", prox = FALSE)
+df[5,]$accur2 <- accur(fit5_2, validation = validation_2)
+#
+fit6 <- train(classe ~ ., data = fold6, method = "rf", prox = FALSE)
+df[6,]$accur1 <- accur(fit6, validation = validation)
+fit6_2 <- train(classe ~ ., data = fold6_2, method = "rf", prox = FALSE)
+df[6,]$accur2 <- accur(fit6_2, validation = validation_2)
+#
+fit7 <- train(classe ~ ., data = fold7, method = "rf", prox = FALSE)
+df[7,]$accur1 <- accur(fit7, validation = validation)
+fit7_2 <- train(classe ~ ., data = fold7_2, method = "rf", prox = FALSE)
+df[7,]$accur2 <- accur(fit7_2, validation = validation_2)
+#
+fit8 <- train(classe ~ ., data = fold8, method = "rf", prox = FALSE)
+df[8,]$accur1 <- accur(fit8, validation = validation)
+fit8_2 <- train(classe ~ ., data = fold8_2, method = "rf", prox = FALSE)
+df[8,]$accur2 <- accur(fit8_2, validation = validation_2)
+#
+fit9 <- train(classe ~ ., data = fold9, method = "rf", prox = FALSE)
+df[9,]$accur1 <- accur(fit9, validation = validation)
+fit9_2 <- train(classe ~ ., data = fold9_2, method = "rf", prox = FALSE)
+df[9,]$accur2 <- accur(fit9_2, validation = validation_2)
+```
+
+## Plotting the results
+```{r plotExperiment, eval = TRUE}
+ggplot(data = df, aes(x=sizes1, y =accur1)) + geom_line(col = 'blue') +
+        geom_line(aes(x = sizes2, y = accur2), col = 'red') +
+        ggtitle("Accuracy of RF vs sample size \n Blue: 10 PC; Red: 18 PC") + 
+        xlab("Sample size") + ylab("Accuracy on a validation set")
+```
+
+# PART 3: Final model
+We have shown that with a random forest model, we gain higher accuracy each time we increment sample size, so we have found a model that really learns from data. Also, accuracy is visibly better with 18 principal components - although computing time is obviusly higher than with 10. 
+
+We will now use all the available training data (dataset _train2_) to estimate a final RF model using 18 principal components. This computation takes more than 1h to perform.
+```{r finalModel, eval = FALSE}
+# fit.final1 <- train(classe ~ ., data = train1, method = "rf", prox = FALSE)
+# accur(fit.final1, validation = test1) #[1] 0.954323
+fit.final2 <- train(classe ~ ., data = train2, method = "rf", prox = FALSE)
+```
+
+The accuracy on the test set is 97.7. The confussion matrix is shown below.
+```{r finalAccuracy}
+accur(fit.final2, validation = test2) #[1] 0.9773654
+predictions <- predict(object = fit.final2, test2)
+#save.image("~/Google Drive/Coursera/course project/course-final.RData")
+# Confussion matrix
+table(test2$classe, predictions)
+```
+
+# APPENDIX: Predict quizz cases
+```{r quizz, eval=FALSE}
+quizz.pred <- predict(object = fit.final2, newdata = testGen)
+length(quizz.pred) #20 predictions!!
+quizz.pred
+```
+
